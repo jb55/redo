@@ -1,0 +1,22 @@
+{
+  "name": "redo",
+  "description": "redo node package",
+  "version": "0.0.0",
+  "repository": {
+    "url": "git://github.com/jb55/redo.git"
+  },
+  "bin": {
+    "redo-always": "redo-always",
+    "redo-ifchange": "redo-ifchange",
+    "redo-ifcreate": "redo-ifcreate",
+    "redo-ood": "redo-ood",
+    "redo-sources": "redo-sources",
+    "redo-stamp": "redo-stamp",
+    "redo-targets": "redo-targets",
+    "redo-unlocked": "redo-unlocked"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
+
+
