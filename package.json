@@ -1,11 +1,12 @@
 {
   "name": "redo",
   "description": "redo node package",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "repository": {
     "url": "git://github.com/jb55/redo.git"
   },
   "bin": {
+    "redo": "redo.py",
     "redo-always": "redo-always.py",
     "redo-ifchange": "redo-ifchange.py",
     "redo-ifcreate": "redo-ifcreate.py",
