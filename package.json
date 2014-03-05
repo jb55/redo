@@ -1,19 +1,19 @@
 {
   "name": "redo.py",
-  "description": "redo npm module",
-  "version": "0.0.1",
+  "description": "apenwarr/redo module",
+  "version": "0.0.2",
   "repository": {
     "url": "git://github.com/jb55/redo.git"
   },
   "bin": {
-    "redo-always": "./redo-always",
-    "redo-ifchange": "./redo-ifchange",
-    "redo-ifcreate": "./redo-ifcreate",
-    "redo-ood": "./redo-ood",
-    "redo-sources": "./redo-sources",
-    "redo-stamp": "./redo-stamp",
-    "redo-targets": "./redo-targets",
-    "redo-unlocked": "./redo-unlocked"
+    "redo-always": "./redo-always.py",
+    "redo-ifchange": "./redo-ifchange.py",
+    "redo-ifcreate": "./redo-ifcreate.py",
+    "redo-ood": "./redo-ood.py",
+    "redo-sources": "./redo-sources.py",
+    "redo-stamp": "./redo-stamp.py",
+    "redo-targets": "./redo-targets.py",
+    "redo-unlocked": "./redo-unlocked.py"
   },
   "dependencies": {},
   "devDependencies": {}
