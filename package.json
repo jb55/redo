@@ -1,11 +1,12 @@
 {
   "name": "redo.py",
   "description": "apenwarr/redo module",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "repository": {
     "url": "git://github.com/jb55/redo.git"
   },
   "bin": {
+    "redo": "./redo.py",
     "redo-always": "./redo-always.py",
     "redo-ifchange": "./redo-ifchange.py",
     "redo-ifcreate": "./redo-ifcreate.py",
