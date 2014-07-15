@@ -6,17 +6,17 @@
     "url": "git://github.com/jb55/redo.git"
   },
   "bin": {
-    "redo": "./redo",
-    "redo-always": "./redo-always",
-    "redo-exec": "./redo-exec",
-    "redo-ifchange": "./redo-ifchange",
-    "redo-dofile": "./redo-dofile",
-    "redo-delegate": "./redo-delegate",
-    "redo-ifcreate": "./redo-ifcreate",
-    "redo-ood": "./redo-ood",
-    "redo-sources": "./redo-sources",
-    "redo-stamp": "./redo-stamp",
-    "redo-targets": "./redo-targets"
+    "redo": "redo.py",
+    "redo-always": "redo.py",
+    "redo-exec": "redo.py",
+    "redo-ifchange": "redo.py",
+    "redo-dofile": "redo.py",
+    "redo-delegate": "redo.py",
+    "redo-ifcreate": "redo.py",
+    "redo-ood": "redo.py",
+    "redo-sources": "redo.py",
+    "redo-stamp": "redo.py",
+    "redo-targets": "redo.py"
   },
   "dependencies": {},
   "devDependencies": {}
