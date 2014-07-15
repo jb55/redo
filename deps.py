@@ -1,62 +1,73 @@
 import sys, os
 import vars, state, builder
-from log import debug
+from log import debug, debug2, debug3, warn
 
 CLEAN = 0
 DIRTY = 1
 
-def isdirty(f, depth, max_changed,
-            is_checked=state.File.is_checked,
-            set_checked=state.File.set_checked_save):
-    if vars.DEBUG >= 1:
-        debug('%s?%s\n' % (depth, f.nicename()))
+# FIXME: sanitize the return values of this function into a tuple instead.
+def isdirty(f, depth, expect_stamp):
+    assert(isinstance(expect_stamp, state.Stamp))
+    debug('%s?%s\n', depth, f.name)
 
-    if f.failed_runid:
-        debug('%s-- DIRTY (failed last time)\n' % depth)
+    debug3('%sexpect: %r\n', depth, expect_stamp)
+    debug3('%sold:    %r\n', depth, f.stamp)
+
+    if not f.is_generated and expect_stamp.is_none() and f.exists():
+        debug('%s-- CLEAN (static)\n', depth)
+        return CLEAN
+    if f.exitcode:
+        debug('%s-- DIRTY (failed last time)\n', depth)
         return DIRTY
-    if f.changed_runid == None:
-        debug('%s-- DIRTY (never built)\n' % depth)
+    if not expect_stamp.is_missing() and f.stamp.is_missing() and not f.stamp.runid():
+        debug('%s-- DIRTY (never built)\n', depth)
         return DIRTY
-    if f.changed_runid > max_changed:
-        debug('%s-- DIRTY (built)\n' % depth)
-        return DIRTY  # has been built more recently than parent
-    if is_checked(f):
-        if vars.DEBUG >= 1:
-            debug('%s-- CLEAN (checked)\n' % depth)
-        return CLEAN  # has already been checked during this session
-    if not f.stamp:
-        debug('%s-- DIRTY (no stamp)\n' % depth)
+    if f.stamp.is_old():
+        debug('%s-- DIRTY (from old redo)\n', depth)
+        return DIRTY
+    if not f.stamp or f.stamp.is_none():
+        debug('%s-- DIRTY (no stamp)\n', depth)
         return DIRTY
 
     newstamp = f.read_stamp()
-    if f.stamp != newstamp:
-        if newstamp == state.STAMP_MISSING:
-            debug('%s-- DIRTY (missing)\n' % depth)
-        else:
-            debug('%s-- DIRTY (mtime)\n' % depth)
-        if f.csum:
-            return [f]
-        else:
+
+    debug3('%snew:    %r\n', depth, newstamp)
+
+    if newstamp.is_override_or_missing(f) and not newstamp.is_missing():
+        if vars.OVERWRITE:
+            debug('%s-- DIRTY (override)\n', depth)
             return DIRTY
+        else:
+            debug('%s-- CLEAN (override)\n', depth)
+            return CLEAN
+
+    if newstamp.is_stamp_dirty(f):
+        if newstamp.is_missing():
+            debug('%s-- DIRTY (missing)\n', depth)
+        else:
+            debug('%s-- DIRTY (mtime)\n', depth)
+        return [f] if f.stamp.is_csum() else DIRTY
 
     must_build = []
-    for mode,f2 in f.deps():
+    for stamp2, f2 in f.deps:
         dirty = CLEAN
-        if mode == 'c':
-            if os.path.exists(os.path.join(vars.BASE, f2.name)):
-                debug('%s-- DIRTY (created)\n' % depth)
+
+        if f2 == state.ALWAYS:
+            if f.stamp_mtime >= vars.RUNID:
+                # has already been checked during this session
+                debug('%s-- CLEAN (always, checked)\n', depth)
+            else:
+                debug('%s-- DIRTY (always)\n', depth)
                 dirty = DIRTY
-        elif mode == 'm':
-            sub = isdirty(f2, depth = depth + '  ',
-                          max_changed = max(f.changed_runid,
-                                            f.checked_runid),
-                          is_checked=is_checked, set_checked=set_checked)
-            if sub:
-                debug('%s-- DIRTY (sub)\n' % depth)
-                dirty = sub
         else:
-            assert(mode in ('c','m'))
-        if not f.csum:
+            f2 = state.File(f2, f.dir)
+            sub = isdirty(f2, depth = depth + '  ',
+                          expect_stamp = stamp2)
+            if sub:
+                debug('%s-- DIRTY (sub)\n', depth)
+                dirty = sub
+
+        if not f.stamp.is_csum():
             # f is a "normal" target: dirty f2 means f is instantly dirty
             if dirty:
                 # if dirty==DIRTY, this means f is definitely dirty.
@@ -71,7 +82,7 @@ def isdirty(f, depth, max_changed,
                 # redo.  However, after that, f might turn out to be
                 # unchanged.
                 return [f]
-            elif isinstance(dirty,list):
+            elif isinstance(dirty, list):
                 # our child f2 might be dirty, but it's not sure yet.  It's
                 # given us a list of targets we have to redo in order to
                 # be sure.
@@ -84,10 +95,14 @@ def isdirty(f, depth, max_changed,
         # redo-ifchange f and it won't have any uncertainty next time.
         return must_build
 
+    if expect_stamp.is_dirty(f):
+        # This must be after we checked the children. Before, we didn't knew
+        # if the current target was dirty or not
+        debug('%s-- DIRTY (parent)\n', depth)
+        return DIRTY
+
     # if we get here, it's because the target is clean
-    if f.is_override:
-        state.warn_override(f.name)
-    set_checked(f)
+    debug2('%s-- CLEAN (dropped off)\n', depth)
     return CLEAN
 
 

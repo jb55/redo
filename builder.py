@@ -1,7 +1,7 @@
 import sys, os, errno, stat
-import vars, jwack, state
+import vars, state, jwack, deps, logger
 from helpers import unlink, close_on_exec, join
-from log import log, log_, debug, debug2, err, warn
+from log import log, log_e, debug, debug2, debug3, err, warn, log_cmd
 
 
 def _default_do_files(filename):
@@ -15,8 +15,8 @@ def _default_do_files(filename):
 
 def _possible_do_files(t):
     dirname,filename = os.path.split(t)
-    yield (os.path.join(vars.BASE, dirname), "%s.do" % filename,
-           '', filename, '')
+    yield (dirname, "%s.do" % filename, '', filename, '')
+    yield (dirname, "%s.do" % filename, '', filename, '')
 
     # It's important to try every possibility in a directory before resorting
     # to a parent directory.  Think about nested projects: I don't want
@@ -24,31 +24,49 @@ def _possible_do_files(t):
     # the former one might just be an artifact of someone embedding my project
     # into theirs as a subdir.  When they do, my rules should still be used
     # for building my project in *all* cases.
-    t = os.path.normpath(os.path.join(vars.BASE, t))
-    dirname,filename = os.path.split(t)
-    dirbits = dirname.split('/')
+    dirbits = os.path.abspath(dirname).split('/')
     for i in range(len(dirbits), -1, -1):
-        basedir = join('/', dirbits[:i])
+        basedir = os.path.join(dirname,
+                               join('/', ['..'] * (len(dirbits) - i)))
         subdir = join('/', dirbits[i:])
         for dofile,basename,ext in _default_do_files(filename):
             yield (basedir, dofile,
                    subdir, os.path.join(subdir, basename), ext)
-        
+
+def _possible_do_files_in_do_dir(t):
+    for dodir,dofile,basedir,basename,ext in _possible_do_files(t):
+        yield (dodir,dofile,basedir,basename,ext)
+
+        dodir2 = os.path.join(dodir, "do")
+        if os.path.islink(dodir2):
+            dodir2 = os.path.realpath(dodir2)
+            d = os.path.relpath(os.path.abspath(dodir), dodir2)
+            basedir2 = os.path.join(d, basedir)
+            basename2= os.path.join(d, basename)
+        else:
+            basedir2 = os.path.join("..", basedir)
+            basename2= os.path.join("..", basename)
+        yield (dodir2, dofile, basedir2, basename2, ext)
 
 def _find_do_file(f):
-    for dodir,dofile,basedir,basename,ext in _possible_do_files(f.name):
+    for dodir,dofile,basedir,basename,ext in _possible_do_files_in_do_dir(f.name):
+        if dodir and not os.path.isdir(dodir):
+            # we don't want to normpath() unless we have no other choice.
+            # otherwise we could have odd behaviour with symlinks (ie.
+            # x/y/../z might not be the same as x/z).  On the other hand,
+            # if one of the path elements doesn't exist (yet), normpath
+            # can help us find the .do file anyway, and that .do file might
+            # create the sub-path.
+            dodir = os.path.normpath(dodir)
         dopath = os.path.join(dodir, dofile)
-        debug2('%s: %s:%s ?\n' % (f.name, dodir, dofile))
+        debug2('%s: %s:%s ?\n', f.name, dodir, dofile)
+        dof = state.File(dopath)
         if os.path.exists(dopath):
-            f.add_dep('m', dopath)
+            f.add_dep(dof)
             return dodir,dofile,basedir,basename,ext
         else:
-            f.add_dep('c', dopath)
+            f.add_dep(dof)
     return None,None,None,None,None
-
-
-def _nice(t):
-    return state.relpath(t, vars.STARTDIR)
 
 
 def _try_stat(filename):
@@ -60,86 +78,105 @@ def _try_stat(filename):
         else:
             raise
 
+def _interpreter_locations(dodir):
+    dodir = os.path.realpath(dodir)
+    dirbits = dodir.split('/')
+    for i in range(len(dirbits), -1, -1):
+        d = join('/', dirbits[:i])
+        yield(d)
+        yield(os.path.join(d, "do"))
+    
 
-class ImmediateReturn(Exception):
-    def __init__(self, rv):
-        Exception.__init__(self, "immediate return with exit code %d" % rv)
-        self.rv = rv
-
+def _find_interpreter(dodir, name):
+    for d in _interpreter_locations(dodir):
+        interp = os.path.join(d, name)
+        if (os.path.exists(interp) and
+            not os.path.isdir(interp) and
+            os.access(interp, os.X_OK)):
+            debug("interpreter found: %s\n", interp)
+            return interp
+        else:
+            debug("interpreter not found: %s\n", interp)
 
 class BuildJob:
-    def __init__(self, t, sf, lock, shouldbuildfunc, donefunc):
-        self.t = t  # original target name, not relative to vars.BASE
-        self.sf = sf
-        tmpbase = t
-        while not os.path.isdir(os.path.dirname(tmpbase) or '.'):
-            ofs = tmpbase.rfind('/')
-            assert(ofs >= 0)
-            tmpbase = tmpbase[:ofs] + '__' + tmpbase[ofs+1:]
-        self.tmpname1 = '%s.redo1.tmp' % tmpbase
-        self.tmpname2 = '%s.redo2.tmp' % tmpbase
-        self.lock = lock
-        self.shouldbuildfunc = shouldbuildfunc
-        self.donefunc = donefunc
-        self.before_t = _try_stat(self.t)
+    def __init__(self, target, result, add_dep_to=None, delegate=None, re_do=True):
+        self.target   = target
+        self.result   = result
+        self.parent   = add_dep_to
+        self.delegate = delegate
+        self.re_do    = re_do
 
-    def start(self):
-        assert(self.lock.owned)
-        try:
-            dirty = self.shouldbuildfunc(self.t)
-            if not dirty:
-                # target doesn't need to be built; skip the whole task
-                return self._after2(0)
-        except ImmediateReturn, e:
-            return self._after2(e.rv)
+    def prepare(self):
+        assert self.target.dolock().owned == state.LOCK_EX
+        self.target.build_starting()
+        self.before_t = _try_stat(self.target.name)
 
-        if vars.NO_OOB or dirty == True:
-            self._start_do()
-        else:
-            self._start_unlocked(dirty)
-
-    def _start_do(self):
-        assert(self.lock.owned)
-        t = self.t
-        sf = self.sf
-        newstamp = sf.read_stamp()
-        if (sf.is_generated and
-            newstamp != state.STAMP_MISSING and 
-            (sf.stamp != newstamp or sf.is_override)):
-                state.warn_override(_nice(t))
-                sf.set_override()
-                sf.set_checked()
-                sf.save()
-                return self._after2(0)
-        if (os.path.exists(t) and not os.path.isdir(t + '/.')
-             and not sf.is_generated):
+        newstamp = self.target.read_stamp()
+        if newstamp.is_override_or_missing(self.target):
+            if newstamp.is_missing():
+                # was marked generated, but is now deleted
+                debug3('oldstamp=%r newstamp=%r\n', self.target.stamp, newstamp)
+                self.target.forget()
+                self.target.refresh()
+            elif vars.OVERWRITE:
+                warn('%s: you modified it; overwrite\n', self.target.printable_name())
+            else:
+                warn('%s: you modified it; skipping\n', self.target.printable_name())
+                return 0
+        if self.target.exists_not_dir() and not self.target.is_generated:
             # an existing source file that was not generated by us.
             # This step is mentioned by djb in his notes.
             # For example, a rule called default.c.do could be used to try
             # to produce hello.c, but we don't want that to happen if
-            # hello.c was created by the end user.
-            # FIXME: always refuse to redo any file that was modified outside
-            # of redo?  That would make it easy for someone to override a
-            # file temporarily, and could be undone by deleting the file.
-            debug2("-- static (%r)\n" % t)
-            sf.set_static()
-            sf.save()
-            return self._after2(0)
-        sf.zap_deps1()
-        (dodir, dofile, basedir, basename, ext) = _find_do_file(sf)
-        if not dofile:
-            if os.path.exists(t):
-                sf.set_static()
-                sf.save()
-                return self._after2(0)
+            # hello.c was created in advance by the end user.
+            if vars.OVERWRITE:
+                warn('%s: exists and not marked as generated; overwrite.\n',
+                     self.target.printable_name())
             else:
-                err('no rule to make %r\n' % t)
-                return self._after2(1)
-        unlink(self.tmpname1)
-        unlink(self.tmpname2)
-        ffd = os.open(self.tmpname1, os.O_CREAT|os.O_RDWR|os.O_EXCL, 0666)
-        close_on_exec(ffd, True)
-        self.f = os.fdopen(ffd, 'w+')
+                warn('%s: exists and not marked as generated; not redoing.\n',
+                     self.target.printable_name())
+                debug2('-- static (%r)\n', self.target.name)
+                return 0
+
+        (self.dodir, self.dofile, self.dobasedir, self.dobasename, self.doext) = _find_do_file(self.target)
+        if not self.dofile:
+            if newstamp.is_missing():
+                err('no rule to make %r\n', self.target.name)
+                return 1
+            else:
+                self.target.forget()
+                debug2('-- forget (%r)\n', self.target.name)
+                return 0  # no longer a generated target, but exists, so ok
+
+        self.outdir = self._mkoutdir()
+        # name connected to stdout
+        self.tmpname_sout = self.target.tmpfilename('out.tmp')
+        # name provided as $3
+        self.tmpname_arg3 = os.path.join(self.outdir, self.target.basename())
+        # name for the log file
+        unlink(self.tmpname_sout)
+        unlink(self.tmpname_arg3)
+        self.log_fd = logger.open_log(self.target, truncate=True)
+        self.tmp_sout_fd = os.open(self.tmpname_sout, os.O_CREAT|os.O_RDWR|os.O_EXCL, 0666)
+        close_on_exec(self.tmp_sout_fd, True)
+        self.tmp_sout_f = os.fdopen(self.tmp_sout_fd, 'w+')
+
+        return None
+
+    def _mkoutdir(self):
+        outdir = self.target.tmpfilename("out")
+        if os.path.exists(outdir):
+            import shutil
+            shutil.rmtree(outdir)
+        os.makedirs(outdir)
+        return outdir
+
+    def build(self):
+        debug3('running build job for %r\n', self.target.name)
+
+        (dodir, dofile, basedir, basename, ext) = (
+            self.dodir, self.dofile, self.dobasedir, self.dobasename, self.doext)
+
         # this will run in the dofile's directory, so use only basenames here
         if vars.OLD_ARGS:
             arg1 = basename  # target name (no extension)
@@ -152,235 +189,209 @@ class BuildJob:
                 arg1,
                 arg2,
                 # temp output file name
-                state.relpath(os.path.abspath(self.tmpname2), dodir),
+                os.path.relpath(self.tmpname_arg3, dodir),
                 ]
         if vars.VERBOSE: argv[1] += 'v'
         if vars.XTRACE: argv[1] += 'x'
-        if vars.VERBOSE or vars.XTRACE: log_('\n')
+        if vars.VERBOSE or vars.XTRACE: log_e('\n')
+
         firstline = open(os.path.join(dodir, dofile)).readline().strip()
-        if firstline.startswith('#!/'):
+        if firstline.startswith('#!.../'):
+            _, _, interp_argv = firstline.partition("/")
+            interp_argv = interp_argv.split(' ')
+            interpreter = _find_interpreter(self.dodir, interp_argv[0])
+            if not interpreter:
+                err('%s unable to find interpreter %s.\n', self.dofile, interp_argv[0])
+                os._exit(208)
+            self.target.add_dep(state.File(interpreter))
+            argv[0:2] = [interpreter] + interp_argv[1:]
+        elif firstline.startswith('#!/'):
             argv[0:2] = firstline[2:].split(' ')
-        log('%s\n' % _nice(t))
-        self.dodir = dodir
-        self.basename = basename
-        self.ext = ext
-        self.argv = argv
-        sf.is_generated = True
-        sf.save()
-        dof = state.File(name=os.path.join(dodir, dofile))
-        dof.set_static()
-        dof.save()
-        state.commit()
-        jwack.start_job(t, self._do_subproc, self._after)
+        log('%s\n', self.target.printable_name())
+        log_cmd("redo", self.target.name + "\n")
 
-    def _start_unlocked(self, dirty):
-        # out-of-band redo of some sub-objects.  This happens when we're not
-        # quite sure if t needs to be built or not (because some children
-        # look dirty, but might turn out to be clean thanks to checksums). 
-        # We have to call redo-unlocked to figure it all out.
-        #
-        # Note: redo-unlocked will handle all the updating of sf, so we
-        # don't have to do it here, nor call _after1.  However, we have to
-        # hold onto the lock because otherwise we would introduce a race
-        # condition; that's why it's called redo-unlocked, because it doesn't
-        # grab a lock.
-        argv = ['redo-unlocked', self.sf.name] + [d.name for d in dirty]
-        log('(%s)\n' % _nice(self.t))
-        state.commit()
-        def run():
-            os.chdir(vars.BASE)
+        try:
+            dn = dodir
+            os.environ['REDO_PWD'] = os.path.join(vars.PWD, dn)
+            os.environ['REDO_TARGET'] = basename + ext
             os.environ['REDO_DEPTH'] = vars.DEPTH + '  '
+            if dn:
+                os.chdir(dn)
+            l = logger.Logger(self.log_fd, self.tmp_sout_fd)
+            l.fork()
+            os.close(self.tmp_sout_fd)
+            close_on_exec(1, False)
+            if vars.VERBOSE or vars.XTRACE: log_e('* %s\n' % ' '.join(argv))
             os.execvp(argv[0], argv)
-            assert(0)
-            # returns only if there's an exception
-        def after(t, rv):
-            return self._after2(rv)
-        jwack.start_job(self.t, run, after)
-
-    def _do_subproc(self):
-        # careful: REDO_PWD was the PWD relative to the STARTPATH at the time
-        # we *started* building the current target; but that target ran
-        # redo-ifchange, and it might have done it from a different directory
-        # than we started it in.  So os.getcwd() might be != REDO_PWD right
-        # now.
-        dn = self.dodir
-        newp = os.path.realpath(dn)
-        os.environ['REDO_PWD'] = state.relpath(newp, vars.STARTDIR)
-        os.environ['REDO_TARGET'] = self.basename + self.ext
-        os.environ['REDO_DEPTH'] = vars.DEPTH + '  '
-        if dn:
-            os.chdir(dn)
-        os.dup2(self.f.fileno(), 1)
-        os.close(self.f.fileno())
-        close_on_exec(1, False)
-        if vars.VERBOSE or vars.XTRACE: log_('* %s\n' % ' '.join(self.argv))
-        os.execvp(self.argv[0], self.argv)
-        assert(0)
-        # returns only if there's an exception
-
-    def _after(self, t, rv):
-        try:
-            state.check_sane()
-            rv = self._after1(t, rv)
-            state.commit()
+        except:
+            import traceback
+            sys.stderr.write(traceback.format_exc())
+            err('internal exception - see above\n')
+            raise
         finally:
-            self._after2(rv)
+            # returns only if there's an exception (exec in other case)
+            os._exit(127)
 
-    def _after1(self, t, rv):
-        f = self.f
-        before_t = self.before_t
-        after_t = _try_stat(t)
-        st1 = os.fstat(f.fileno())
-        st2 = _try_stat(self.tmpname2)
-        if (after_t and 
-            (not before_t or before_t.st_ctime != after_t.st_ctime) and
-            not stat.S_ISDIR(after_t.st_mode)):
-            err('%s modified %s directly!\n' % (self.argv[2], t))
-            err('...you should update $3 (a temp file) or stdout, not $1.\n')
-            rv = 206
-        elif st2 and st1.st_size > 0:
-            err('%s wrote to stdout *and* created $3.\n' % self.argv[2])
-            err('...you should write status messages to stderr, not stdout.\n')
-            rv = 207
-        if rv==0:
-            if st2:
-                os.rename(self.tmpname2, t)
-                os.unlink(self.tmpname1)
-            elif st1.st_size > 0:
-                try:
-                    os.rename(self.tmpname1, t)
-                except OSError, e:
-                    if e.errno == errno.ENOENT:
-                        unlink(t)
-                    else:
-                        raise
+    def done(self, t, rv):
+        assert self.target.dolock().owned == state.LOCK_EX
+        log_cmd("redo_done", self.target.name + "\n")
+        try:
+            after_t = _try_stat(self.target.name)
+            st1 = os.fstat(self.tmp_sout_f.fileno())
+            st2 = _try_stat(self.tmpname_arg3)
+            
+            if (after_t and 
+                (not self.before_t or self.before_t.st_ctime != after_t.st_ctime) and
+                not stat.S_ISDIR(after_t.st_mode)):
+                    err('%s modified %s directly!\n', self.dofile, self.target.name)
+                    err('...you should update $3 (a temp file) or stdout, not $1.\n')
+                    rv = 206
+
+            elif vars.OLD_STDOUT and st2 and st1.st_size > 0:
+                err('%s wrote to stdout *and* created $3.\n', self.dofile)
+                err('...you should write status messages to stderr, not stdout.\n')
+                rv = 207
+
+            elif vars.WARN_STDOUT and st1.st_size > 0:
+                err('%s wrote to stdout, this is not longer supported.\n', self.dofile)
+                err('...you should write status messages to stderr, not stdout.\n')
+                err('...you should write target content to $3 using for example \'exec >"$3"`.\n')
+                if not vars.OLD_STDOUT: rv = 207
+            
+            if rv==0:
                 if st2:
-                    os.unlink(self.tmpname2)
-            else: # no output generated at all; that's ok
-                unlink(self.tmpname1)
-                unlink(t)
-            sf = self.sf
-            sf.refresh()
-            sf.is_generated = True
-            sf.is_override = False
-            if sf.is_checked() or sf.is_changed():
-                # it got checked during the run; someone ran redo-stamp.
-                # update_stamp would call set_changed(); we don't want that
-                sf.stamp = sf.read_stamp()
+                    os.rename(self.tmpname_arg3, self.target.name)
+                    os.unlink(self.tmpname_sout)
+                elif vars.OLD_STDOUT and st1.st_size > 0:
+                    try:
+                        os.rename(self.tmpname_sout, self.target.name)
+                    except OSError, e:
+                        if e.errno == errno.ENOENT:
+                            unlink(self.target.name)
+                        else:
+                            raise
+                else: # no output generated at all; that's ok
+                    unlink(self.tmpname_sout)
+                    unlink(self.target.name)
+                if vars.VERBOSE or vars.XTRACE or vars.DEBUG:
+                    log('%s (done)\n\n', self.target.printable_name())
             else:
-                sf.csum = None
-                sf.update_stamp()
-                sf.set_changed()
-        else:
-            unlink(self.tmpname1)
-            unlink(self.tmpname2)
-            sf = self.sf
-            sf.set_failed()
-        sf.zap_deps2()
-        sf.save()
-        f.close()
-        if rv != 0:
-            err('%s: exit code %d\n' % (_nice(t),rv))
-        else:
-            if vars.VERBOSE or vars.XTRACE or vars.DEBUG:
-                log('%s (done)\n\n' % _nice(t))
-        return rv
+                unlink(self.tmpname_sout)
+                unlink(self.tmpname_arg3)
 
-    def _after2(self, rv):
-        try:
-            self.donefunc(self.t, rv)
-            assert(self.lock.owned)
+            if rv != 0:
+                if vars.ONLY_LOG:
+                    logger.print_log(self.target)
+                err('%s: exit code %d\n', self.target.printable_name(), rv)
+            self.target.build_done(exitcode=rv)
+            self.target.refresh()
+
+            self._move_extra_results(self.outdir, self.target.dirname() or ".", rv)
+
+            self.result[0] += rv
+            self.result[1] += 1
+            if self.parent:
+                self.parent.add_dep(self.target)
+
         finally:
-            self.lock.unlock()
+            self.tmp_sout_f.close()
+            self.target.dolock().unlock()
 
+    def _move_extra_results(self, src, dest, rv):
+        assert src
+        assert dest
+        if os.path.isdir(src) and os.path.isdir(dest):
+            for f in os.listdir(src):
+                sp = os.path.join(src, f)
+                dp = os.path.join(dest, f)
+                self._move_extra_results(sp, dp, rv)
+            os.rmdir(src)
+        else:
+            sf = state.File(name=dest)
+            if sf == self.delegate:
+                dest = os.path.join(sf.tmpfilename("out"), sf.basename())
+                debug("rename %r %r\n", src, dest)
+                os.rename(src, dest)
+                sf.copy_deps_from(self.target)
+            else:
+                sf.dolock().trylock()
+                if sf.dolock().owned == state.LOCK_EX:
+                    try:
+                        sf.build_starting()
+                        debug("rename %r %r\n", src, dest)
+                        os.rename(src, dest)
+                        sf.copy_deps_from(self.target)
+                        sf.build_done(rv)
+                    finally:
+                        sf.dolock().unlock()
+                else:
+                    warn("%s: discarding (parallel build)\n", dest)
+                    unlink(src)
 
-def main(targets, shouldbuildfunc):
-    retcode = [0]  # a list so that it can be reassigned from done()
+    def schedule_job(self):
+        assert self.target.dolock().owned == state.LOCK_EX
+        rv = self.prepare()
+        if rv != None:
+            self.result[0] += rv
+            self.result[1] += 1
+        else:
+            jwack.start_job(self.target, self.build, self.done)
+
+def build(f, any_errors, should_build, add_dep_to=None, delegate=None, re_do=True):
+    if f.dolock():
+        if f.check_deadlocks():
+            err("%s: recursive dependency, breaking deadlock\n", f.printable_name())
+            any_errors[0] += 1
+            any_errors[1] += 1
+        else:
+            jwack.get_token(f)
+            f.dolock().waitlock()
+            if any_errors[0] and not vars.KEEP_GOING:
+                return False
+            f.refresh()
+            debug3('think about building %r\n', f.name)
+            dirty = should_build(f)
+            while dirty and dirty != deps.DIRTY:
+                # FIXME: bring back the old (targetname) notation in the output
+                #  when we need to do this.  And add comments.
+                for t2 in dirty:
+                    if not build(t2, any_errors, should_build, delegate, re_do):
+                        return False
+                jwack.wait_all()
+                dirty = should_build(f)
+            if dirty:
+                job = BuildJob(f, any_errors, add_dep_to, delegate, re_do)
+                add_dep_to = None
+                job.schedule_job()
+            else:
+                f.dolock().unlock()
+    if add_dep_to:
+        f.refresh()
+        add_dep_to.add_dep(f)
+    return True
+
+def main(targets, should_build = (lambda f: deps.DIRTY), parent=None, delegate=None, re_do=True):
+    any_errors = [0, 0]
     if vars.SHUFFLE:
         import random
         random.shuffle(targets)
 
-    locked = []
+    if delegate:
+        debug("delegated: %s\n", delegate)
 
-    def done(t, rv):
-        if rv:
-            retcode[0] = 1
-
-    # In the first cycle, we just build as much as we can without worrying
-    # about any lock contention.  If someone else has it locked, we move on.
-    seen = {}
-    lock = None
-    for t in targets:
-        if t in seen:
-            continue
-        seen[t] = 1
-        if not jwack.has_token():
-            state.commit()
-        jwack.get_token(t)
-        if retcode[0] and not vars.KEEP_GOING:
-            break
-        if not state.check_sane():
-            err('.redo directory disappeared; cannot continue.\n')
-            retcode[0] = 205
-            break
-        f = state.File(name=t)
-        lock = state.Lock(f.id)
-        if vars.UNLOCKED:
-            lock.owned = True
-        else:
-            lock.trylock()
-        if not lock.owned:
-            if vars.DEBUG_LOCKS:
-                log('%s (locked...)\n' % _nice(t))
-            locked.append((f.id,t))
-        else:
-            BuildJob(t, f, lock, shouldbuildfunc, done).start()
-
-    del lock
-
-    # Now we've built all the "easy" ones.  Go back and just wait on the
-    # remaining ones one by one.  There's no reason to do it any more
-    # efficiently, because if these targets were previously locked, that
-    # means someone else was building them; thus, we probably won't need to
-    # do anything.  The only exception is if we're invoked as redo instead
-    # of redo-ifchange; then we have to redo it even if someone else already
-    # did.  But that should be rare.
-    while locked or jwack.running():
-        state.commit()
-        jwack.wait_all()
-        # at this point, we don't have any children holding any tokens, so
-        # it's okay to block below.
-        if retcode[0] and not vars.KEEP_GOING:
-            break
-        if locked:
-            if not state.check_sane():
-                err('.redo directory disappeared; cannot continue.\n')
-                retcode[0] = 205
+    try:
+        for t in targets:
+            f = state.File(name=t)
+            if not build(f, any_errors, should_build, add_dep_to=parent, delegate=delegate, re_do=re_do):
                 break
-            fid,t = locked.pop(0)
-            lock = state.Lock(fid)
-            lock.trylock()
-            while not lock.owned:
-                if vars.DEBUG_LOCKS:
-                    warn('%s (WAITING)\n' % _nice(t))
-                # this sequence looks a little silly, but the idea is to
-                # give up our personal token while we wait for the lock to
-                # be released; but we should never run get_token() while
-                # holding a lock, or we could cause deadlocks.
-                jwack.release_mine()
-                lock.waitlock()
-                lock.unlock()
-                jwack.get_token(t)
-                lock.trylock()
-            assert(lock.owned)
-            if vars.DEBUG_LOCKS:
-                log('%s (...unlocked!)\n' % _nice(t))
-            if state.File(name=t).is_failed():
-                err('%s: failed in another thread\n' % _nice(t))
-                retcode[0] = 2
-                lock.unlock()
-            else:
-                BuildJob(t, state.File(id=fid), lock,
-                         shouldbuildfunc, done).start()
-    state.commit()
-    return retcode[0]
+        jwack.wait_all()
+    finally:
+        jwack.force_return_tokens()
+
+    if any_errors[1] == 1:
+        return any_errors[0]
+    elif any_errors[0]:
+        return 1
+    else:
+        return 0
+

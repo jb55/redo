@@ -1,4 +1,4 @@
-rm -rf t/.redo redo-sh
+rm -rf t/.redo redo-sh redo-sh.tmp
 if [ -e .do_built ]; then
 	while read x; do
 		[ -d "$x" ] || rm -f "$x"
@@ -8,3 +8,4 @@ fi
 redo t/clean Documentation/clean version/clean
 rm -f *~ .*~ */*~ */.*~ *.pyc install.wrapper
 find . -name '*.tmp' -exec rm -fv {} \;
+find . -name '*.redo' -exec rm -fv {} \;

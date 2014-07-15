@@ -71,11 +71,7 @@ def _try_read(fd, n):
     return b and b or None  # None means EOF
 
 
-def setup(maxjobs):
-    global _fds, _toplevel
-    if _fds:
-        return  # already set up
-    _debug('setup(%d)\n' % maxjobs)
+def _find_fds():
     flags = ' ' + os.getenv('MAKEFLAGS', '') + ' '
     FIND = ' --jobserver-fds='
     ofs = flags.find(FIND)
@@ -95,15 +91,54 @@ def setup(maxjobs):
                 raise ValueError('broken --jobserver-fds from make; prefix your Makefile rule with a "+"')
             else:
                 raise
-        _fds = (a,b)
+        return (a,b)
+    else:
+        return None
+
+
+def cleanup_makeflags(flags):
+    i = flags.find("--jobserver-fds=")
+    if i >= 0:
+        prefix = flags[0:i] if i > 0 else ""
+        j = i
+        while j < len(flags):
+            if flags[j].isspace(): break
+            j += 1
+        if (flags[j+1:] + " ").startswith("-j "):
+            j += 2
+        return prefix + flags[j+1:]
+    else:
+        return flags
+
+
+def cleanup_on_exec():
+    "Close file descriptors"
+    fds = _find_fds()
+    if fds:
+        a, b = fds
+        close_on_exec(a, True)
+        close_on_exec(b, True)
+    for waitfd in os.environ.get('REDO_JWACK', '').split(','):
+        waitfd = atoi(waitfd, None)
+        if waitfd != None: close_on_exec(waitfd, True)
+    del os.environ['REDO_JWACK']
+    os.environ['MAKEFLAGS'] = cleanup_makeflags(os.getenv('MAKEFLAGS'))
+
+
+def setup(maxjobs):
+    "Start the job server"
+    global _fds, _toplevel
+    if _fds:
+        return  # already set up
+    _debug('setup(%d)\n' % maxjobs)
+    _fds = _find_fds()
     if maxjobs and not _fds:
         # need to start a new server
         _toplevel = maxjobs
         _fds = _make_pipe(100)
         _release(maxjobs-1)
-        os.putenv('MAKEFLAGS',
-                  '%s --jobserver-fds=%d,%d -j' % (os.getenv('MAKEFLAGS'),
-                                                    _fds[0], _fds[1]))
+        os.environ['MAKEFLAGS'] = '%s --jobserver-fds=%d,%d -j' % (
+            os.getenv('MAKEFLAGS'), _fds[0], _fds[1])
 
 
 def wait(want_token):
@@ -135,11 +170,13 @@ def wait(want_token):
 
 
 def has_token():
+    "Return True if we have one or more tokens available"
     if _mytokens >= 1:
         return True
 
 
 def get_token(reason):
+    "Ensure we have one token available."
     global _mytokens
     assert(_mytokens <= 1)
     setup(1)
@@ -167,10 +204,12 @@ def get_token(reason):
 
 
 def running():
+    "Tell if jobs are running"
     return len(_waitfds)
 
 
 def wait_all():
+    "Wait for all jobs to be finished"
     _debug("wait_all\n")
     while running():
         while _mytokens >= 1:
@@ -220,6 +259,11 @@ class Job:
 
             
 def start_job(reason, jobfunc, donefunc):
+    """
+    Start a job
+    jobfunc:  executed in the child process
+    doncfunc: executed in the parent process during a wait or wait_all call
+    """
     global _mytokens
     assert(_mytokens <= 1)
     get_token(reason)
@@ -231,6 +275,7 @@ def start_job(reason, jobfunc, donefunc):
     if pid == 0:
         # child
         os.close(r)
+        os.environ['REDO_JWACK'] = "%s,%d" % (os.environ.get('REDO_JWACK'), w)
         rv = 201
         try:
             try:

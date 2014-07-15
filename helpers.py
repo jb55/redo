@@ -3,7 +3,7 @@ from atoi import atoi
 
 
 def join(between, l):
-    return between.join(l)
+    return between.join(str(i) for i in l)
 
 
 def unlink(f):
@@ -25,5 +25,4 @@ def close_on_exec(fd, yes):
     if yes:
         fl |= fcntl.FD_CLOEXEC
     fcntl.fcntl(fd, fcntl.F_SETFD, fl)
-
 

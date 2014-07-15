@@ -8,7 +8,7 @@ YELLOW = ""
 BOLD   = ""
 PLAIN  = ""
 
-if sys.stderr.isatty() and (os.environ.get('TERM') or 'dumb') != 'dumb':
+if vars.COLOR:
     # ...use ANSI formatting codes.
     RED    = "\x1b[31m"
     GREEN  = "\x1b[32m"
@@ -17,33 +17,75 @@ if sys.stderr.isatty() and (os.environ.get('TERM') or 'dumb') != 'dumb':
     PLAIN  = "\x1b[m"
 
 
-def log_(s):
-    sys.stdout.flush()
-    if vars.DEBUG_PIDS:
-        sys.stderr.write('%d %s' % (os.getpid(), s))
+LOGFILE = os.fdopen(vars.LOGFD, "a") if vars.LOGFD else sys.stderr
+
+
+def _cmd_encode(stamp, line):
+    return "\0%s\0%s" % (stamp, line.replace("\0", "\0z\0"))
+
+
+def log_cmd(cmd, arg):
+    from logger import LOGCMD, LOCKCMD
+    if LOGCMD:
+        with LOCKCMD.write():
+            os.write(LOGCMD, _cmd_encode(cmd, arg))
+            os.fsync(LOGCMD)
+
+
+def _fmt(s, *args):
+    if args:
+        return s % args
     else:
-        sys.stderr.write(s)
+        return s
+    
+
+def _log(f, s, *args):
+    ss = _fmt(s, *args)
+    sys.stdout.flush()
     sys.stderr.flush()
+    f.flush()
+    if vars.DEBUG_PIDS:
+        f.write('%d %s' % (os.getpid(), ss))
+    else:
+        f.write(ss)
+    f.flush()
+
+def log_e(s, *args):
+    _log(sys.stderr, s, *args)
+
+def log_l(s, *args):
+    _log(LOGFILE, s, *args)
+
+def _color(s, color):
+    if s.endswith("\n"):
+        return ''.join([color, "redo  ", vars.DEPTH, BOLD, s[:-1], PLAIN, s[-1]])
+    else:
+        return ''.join([color, "redo  ", vars.DEPTH, BOLD, s, PLAIN])
+
+def log(s, *args):
+    log_l(_color(s, GREEN), *args)
 
 
-def log(s):
-    log_(''.join([GREEN,  "redo  ", vars.DEPTH, BOLD, s, PLAIN]))
-
-def err(s):
-    log_(''.join([RED,    "redo  ", vars.DEPTH, BOLD, s, PLAIN]))
-
-def warn(s):
-    log_(''.join([YELLOW, "redo  ", vars.DEPTH, BOLD, s, PLAIN]))
+def err(s, *args):
+    log_l(_color(s, RED), *args)
+    log_cmd("redo_err", _fmt(s, *args))
 
 
-def debug(s):
+def warn(s, *args):
+    log_l(_color(s, YELLOW), *args)
+    log_cmd("redo_warn", _fmt(s, *args))
+
+
+def debug(s, *args):
     if vars.DEBUG >= 1:
-        log_('redo: %s%s' % (vars.DEPTH, s))
-def debug2(s):
+        log_l('redo: %s%s' % (vars.DEPTH, s), *args)
+
+
+def debug2(s, *args):
     if vars.DEBUG >= 2:
-        log_('redo: %s%s' % (vars.DEPTH, s))
-def debug3(s):
+        log_l('redo: %s%s' % (vars.DEPTH, s), *args)
+
+
+def debug3(s, *args):
     if vars.DEBUG >= 3:
-        log_('redo: %s%s' % (vars.DEPTH, s))
-
-
+        log_l('redo: %s%s' % (vars.DEPTH, s), *args)
